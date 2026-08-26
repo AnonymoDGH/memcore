@@ -86,6 +86,66 @@ static void ln_bwd_accum(float *dx_in, const float *dout, const float *in,
     }
 }
 
+void model_init(Model *mo) {
+    mo->tok_emb = mat_new(VOCAB_SIZE, D_MODEL);
+    mo->pos_emb = mat_new(SEQ_LEN, D_MODEL);
+    for (int l = 0; l < N_LAYERS; l++) {
+        mo->ln1_g[l] = mat_new(1, D_MODEL);
+        mo->ln1_b[l] = mat_new(1, D_MODEL);
+        mo->wq[l] = mat_new(D_MODEL, D_MODEL);
+        mo->bq[l] = mat_new(1, D_MODEL);
+        mo->wk[l] = mat_new(D_MODEL, D_MODEL);
+        mo->bk[l] = mat_new(1, D_MODEL);
+        mo->wv[l] = mat_new(D_MODEL, D_MODEL);
+        mo->bv[l] = mat_new(1, D_MODEL);
+        mo->wo[l] = mat_new(D_MODEL, D_MODEL);
+        mo->ob[l] = mat_new(1, D_MODEL);
+        mo->ln2_g[l] = mat_new(1, D_MODEL);
+        mo->ln2_b[l] = mat_new(1, D_MODEL);
+        mo->fc1[l] = mat_new(D_MODEL, FF_HIDDEN);
+        mo->fb1[l] = mat_new(1, FF_HIDDEN);
+        mo->fc2[l] = mat_new(FF_HIDDEN, D_MODEL);
+        mo->fb2[l] = mat_new(1, D_MODEL);
+        mat_fill(mo->ln1_g[l], 1.0f);
+        mat_fill(mo->ln2_g[l], 1.0f);
+    }
+    mo->lnf_g = mat_new(1, D_MODEL);
+    mo->lnf_b = mat_new(1, D_MODEL);
+    mat_fill(mo->lnf_g, 1.0f);
+    mo->wout = mat_new(D_MODEL, VOCAB_SIZE);
+
+    mat_randn(mo->tok_emb, 0.02f);
+    mat_randn(mo->pos_emb, 0.01f);
+    float s_attn = 1.0f / sqrtf((float)D_MODEL);
+    float s_ff2 = 1.0f / sqrtf((float)FF_HIDDEN);
+    for (int l = 0; l < N_LAYERS; l++) {
+        mat_randn(mo->wq[l], s_attn);
+        mat_randn(mo->wk[l], s_attn);
+        mat_randn(mo->wv[l], s_attn);
+        mat_randn(mo->wo[l], s_attn);
+        mat_randn(mo->fc1[l], s_attn);
+        mat_randn(mo->fc2[l], s_ff2);
+    }
+    mat_randn(mo->wout, s_attn);
+}
+
+void model_free(Model *mo) {
+    if (!mo || !mo->tok_emb) return;
+    mat_free(mo->tok_emb); mat_free(mo->pos_emb);
+    for (int l = 0; l < N_LAYERS; l++) {
+        mat_free(mo->ln1_g[l]); mat_free(mo->ln1_b[l]);
+        mat_free(mo->wq[l]); mat_free(mo->bq[l]);
+        mat_free(mo->wk[l]); mat_free(mo->bk[l]);
+        mat_free(mo->wv[l]); mat_free(mo->bv[l]);
+        mat_free(mo->wo[l]); mat_free(mo->ob[l]);
+        mat_free(mo->ln2_g[l]); mat_free(mo->ln2_b[l]);
+        mat_free(mo->fc1[l]); mat_free(mo->fb1[l]);
+        mat_free(mo->fc2[l]); mat_free(mo->fb2[l]);
+    }
+    mat_free(mo->lnf_g); mat_free(mo->lnf_b); mat_free(mo->wout);
+    memset(mo, 0, sizeof(*mo));
+}
+
 static void model_alloc_grads(Model *g) {
     g->tok_emb = mat_new(VOCAB_SIZE, D_MODEL);
     g->pos_emb = mat_new(SEQ_LEN, D_MODEL);
@@ -140,6 +200,7 @@ void act_alloc(Activations *a) {
     a->seq = S;
     a->x_in = malloc(SD * sizeof(float));
     a->x_final = malloc(SD * sizeof(float));
+    a->lnf = malloc(SD * sizeof(float));
     a->probs_final = malloc((size_t)S * V * sizeof(float));
     a->logits_core = malloc((size_t)S * V * sizeof(float));
     for (int l = 0; l <= N_LAYERS; l++)
@@ -169,6 +230,7 @@ void act_alloc(Activations *a) {
 void act_free(Activations *a) {
     free(a->x_in);
     free(a->x_final);
+    free(a->lnf);
     free(a->probs_final);
     free(a->logits_core);
     for (int l = 0; l <= N_LAYERS; l++) free(a->x_layer[l]);
@@ -339,6 +401,8 @@ void model_backward(Trainer *tr, const int *tokens, const int *targets) {
         for (int t = 0; t < S; t++) {
             float *dffo = d_blk_out + t * D;
             float dvec_f[FF_HIDDEN], dvec_d[D_MODEL];
+            memset(dvec_f, 0, sizeof(dvec_f));
+            memset(dvec_d, 0, sizeof(dvec_d));
             linear_bwd(a->ff_act[l] + t * F, dffo, g->fc2[l], g->fb2[l],
                        dvec_f, m->fc2[l]);
             for (int f = 0; f < F; f++)
@@ -351,6 +415,7 @@ void model_backward(Trainer *tr, const int *tokens, const int *targets) {
                          a->ln_mean[l][1][t], a->ln_rstd[l][1][t], D);
         }
 
+        memset(dattn_cat, 0, SD * sizeof(float));
         for (int t = 0; t < S; t++)
             linear_bwd(a->attn_cat[l] + t * D, dx_mid + t * D, g->wo[l],
                        g->ob[l], dattn_cat + t * D, m->wo[l]);

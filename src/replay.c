@@ -25,6 +25,7 @@ void rb_push(ReplayBuf *rb, const int *window) {
 }
 
 void rb_sample(const ReplayBuf *rb, int *out_window, float *randval) {
+    (void)randval;
     if (rb->count == 0) return;
     int idx = (int)(rng_uniform() * (float)rb->count) % rb->count;
     memcpy(out_window, rb->slots + (size_t)idx * SEQ_LEN,
