@@ -566,6 +566,29 @@ void model_zero_grads(Trainer *tr) {
     for (int i = 0; i < n; i++) mat_fill(lst[i], 0.0f);
 }
 
+float model_clip_grads(Trainer *tr, float max_norm) {
+    Mat *lst[MAX_PARAMS];
+    int n = 0;
+    collect(&tr->g, lst, &n);
+    double sq = 0.0;
+    for (int i = 0; i < n; i++) {
+        size_t cnt = (size_t)lst[i]->rows * lst[i]->cols;
+        const float *d = lst[i]->data;
+        for (size_t e = 0; e < cnt; e++) sq += (double)d[e] * d[e];
+    }
+    float norm = (float)sqrt(sq);
+    if (norm > max_norm && norm > 0.0f) {
+        float sc = max_norm / norm;
+        for (int i = 0; i < n; i++) {
+            size_t cnt = (size_t)lst[i]->rows * lst[i]->cols;
+            float *d = lst[i]->data;
+            for (size_t e = 0; e < cnt; e++) d[e] *= sc;
+        }
+        return sc;
+    }
+    return 1.0f;
+}
+
 void model_adam_step(Trainer *tr, float lr) {
     Mat *pm[MAX_PARAMS], *pg[MAX_PARAMS], *pmm[MAX_PARAMS], *pv[MAX_PARAMS];
     int n1 = 0, n2 = 0, n3 = 0, n4 = 0;

@@ -69,6 +69,7 @@ float model_forward(Trainer *tr, const int *tokens, const int *targets,
                     const float *mem_logits);
 void model_backward(Trainer *tr, const int *tokens, const int *targets);
 void model_zero_grads(Trainer *tr);
+float model_clip_grads(Trainer *tr, float max_norm);
 void model_adam_step(Trainer *tr, float lr);
 
 #endif
