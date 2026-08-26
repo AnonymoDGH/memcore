@@ -52,13 +52,61 @@ token ──> [Atención local pequeña] ──┬──> logits ──> predicc
 ## Compilar
 
 ```sh
-make          # binario memcore
-make test     # tests rápidos
-./memcore train data.txt   # aprendizaje continuo sobre un archivo
-./memcore gen "hola"       # generar texto
+gcc -O2 -Wall -Wextra -std=c11 -Isrc -o memcore.exe \
+    src/tensor.c src/tokenizer.c src/attention.c src/neural_mem.c \
+    src/replay.c src/train.c src/main.c -lm
 ```
+
+## Uso
+
+```sh
+./memcore info                          # arquitectura y nº de parámetros
+./memcore train data.txt -n 3000        # aprendizaje continuo (resume si hay checkpoint)
+./memcore gen "el sol" 140              # generar (usa model.core/model.mem)
+    -t 0.5   temperatura                -m 0/1  memoria neuronal on/off
+./memcore chat                          # REPL: aprende tu línea ANTES de responder
+    :save :exit :temp 0.7
+```
+
+El entrenamiento es **incremental**: cada pasada por `train` reanuda desde el
+checkpoint (`model.core` + `model.mem`), así que puedes alimentarlo con archivos
+nuevos sin reentrenar desde cero.
+
+## Verificación
+
+`config/test.c` hace **gradient check numérico** del backward completo
+(diferencias centrales vs gradiente analítico en 8 tensores):
+
+```sh
+gcc -g -O0 -Wall -std=c11 -Isrc -o gradcheck.exe config/test.c \
+    src/tensor.c src/tokenizer.c src/attention.c src/neural_mem.c \
+    src/replay.c src/train.c -lm && ./gradcheck.exe
+```
+
+## Resultados actuales
+
+- Corpus demo (10 líneas en español, ~18 KB): loss 4.3 → **0.44** en 3 pasadas.
+- Generación coherente con el corpus: `"el sol sale por la"` → `" manana…"`.
+- La memoria neuronal muestra sorpresa adaptativa (se calma con texto esperable,
+  se activa con contenido nuevo).
+
+## Lecciones de implementación (hard-won)
+
+1. Los buffers de gradiente que acumulan con `+=` deben inicializarse a cero
+   (memoria no inicializada → NaNs silenciosos → divergencia).
+2. Sin clipping de norma global, Adam a 3e-4 diverge en este micro-modelo;
+   con clip a 1.0, converge estable.
+3. En generación, la predicción debe leerse en la **posición del último token
+   válido**: la atención causal hace que el padding posterior sea inerte.
+4. Contextos sintéticos (padding masivo, prompts repetidos) descarrilan al
+   modelo; sembrar desde el replay buffer mantiene la distribución real.
 
 ## Estado
 
-- [ ] Esqueleto del proyecto
-- [x] README
+- [x] Núcleo transformer con forward/backward/Adam en C puro
+- [x] Memoria neuronal con escritura por sorpresa + persistencia
+- [x] Replay buffer anti-olvido
+- [x] Gradient check numérico verde
+- [x] Entrenamiento continuo incremental entre sesiones
+- [ ] Cuantización int8 de pesos (hoy fp32)
+- [ ] KV-cache para generación incremental
