@@ -1,0 +1,19 @@
+# build
+*.o
+*.obj
+*.exe
+memcore
+memcore_debug
+*.d
+
+# model artifacts
+*.bin
+*.ckpt
+data/*.txt
+!data/sample.txt
+
+# editors / os
+.vscode/
+.idea/
+*.swp
+Thumbs.db
