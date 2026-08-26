@@ -51,6 +51,12 @@ static int cmd_train(const char *file, const char *prefix, int max_windows,
     s->core_lr = lr;
     s->use_replay = use_replay;
     s->use_mem = use_mem;
+
+    if (tok_ensure(file, "data/bpe.bin") != 0) {
+        fprintf(stderr, "error: cannot build tokenizer\n");
+        return 1;
+    }
+    printf("[tokenizer: %s]\n", tok_name());
     char core_path[512], mem_path[512];
     snprintf(core_path, sizeof(core_path), "%s.core", prefix);
     snprintf(mem_path, sizeof(mem_path), "%s.mem", prefix);

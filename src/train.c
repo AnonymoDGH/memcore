@@ -31,80 +31,84 @@ void sess_free(Session *s) {
     free(s);
 }
 
-float sess_train_window(Session *s, const int *window) {
+static void shift_targets(const int *window, int *tgt) {
+    for (int t = 0; t < SEQ_LEN - 1; t++) tgt[t] = window[t + 1];
+    tgt[SEQ_LEN - 1] = window[SEQ_LEN - 1];
+}
+
+float sess_train_batch(Session *s, int wins[][SEQ_LEN + 1], int nb) {
     Trainer *tr = s->core;
     Activations *a = &tr->act;
 
-    for (int t = 0; t < SEQ_LEN - 1; t++)
-        dummy_targets[t] = window[t + 1];
-    dummy_targets[SEQ_LEN - 1] = window[SEQ_LEN - 1];
-
     model_zero_grads(tr);
-    float loss =
-        model_forward(tr, window, dummy_targets, NULL);
-    model_backward(tr, window, dummy_targets);
-    model_clip_grads(tr, 1.0f);
-    model_adam_step(tr, s->core_lr);
+    double loss = 0.0;
+    for (int k = 0; k < nb; k++) {
+        shift_targets(wins[k], dummy_targets);
+        loss += model_forward(tr, wins[k], dummy_targets, NULL);
+        model_backward(tr, wins[k], dummy_targets);
 
-    if (s->use_mem) {
-        float surprise_sum = 0.0f;
         for (int t = 0; t < SEQ_LEN; t++) {
-            int tgt = (t + 1 < SEQ_LEN) ? window[t + 1] : window[t];
-            surprise_sum += nmem_surprise_update(
-                s->mem, a->x_final + t * D_MODEL, tgt, s->mem_lr_scale);
+            int tgt = (t + 1 < SEQ_LEN) ? wins[k][t + 1] : wins[k][t];
+            nmem_surprise_update(s->mem, a->x_final + t * D_MODEL, tgt,
+                                 s->mem_lr_scale);
         }
+        rb_push(s->replay, wins[k]);
     }
 
-    rb_push(s->replay, window);
-    if (s->use_replay && s->step % 2 == 1 && s->replay->count > 8) {
-        int rwin[SEQ_LEN];
-        for (int k = 0; k < 2; k++) {
-            rb_sample(s->replay, rwin, NULL);
-            for (int t = 0; t < SEQ_LEN - 1; t++)
-                dummy_targets[t] = rwin[t + 1];
-            dummy_targets[SEQ_LEN - 1] = rwin[SEQ_LEN - 1];
-            model_zero_grads(tr);
-            float rloss = model_forward(tr, rwin, dummy_targets, NULL);
-            model_backward(tr, rwin, dummy_targets);
-            model_clip_grads(tr, 1.0f);
-            model_adam_step(tr, s->core_lr * 0.5f);
-            loss = 0.7f * loss + 0.3f * rloss;
-            if (s->use_mem) {
-                for (int t = 0; t < SEQ_LEN; t++) {
-                    int tgt = (t + 1 < SEQ_LEN) ? rwin[t + 1] : rwin[t];
-                    nmem_surprise_update(s->mem, a->x_final + t * D_MODEL,
-                                         tgt, s->mem_lr_scale * 0.5f);
-                }
-            }
-        }
-    }
+    model_clip_grads(tr, 1.0f);
+    float warm = fminf(1.0f, (float)(s->step + 1) / 300.0f);
+    model_adam_step(tr, s->core_lr * warm);
 
-    s->loss_ema = s->loss_ema == 0.0 ? loss : 0.95f * s->loss_ema + 0.05f * loss;
+    float avg = (float)(loss / nb);
+    s->loss_ema =
+        s->loss_ema == 0.0 ? avg : 0.95f * s->loss_ema + 0.05f * avg;
     s->step++;
-    return loss;
+    return avg;
+}
+
+float sess_train_window(Session *s, const int *window) {
+    int one[1][SEQ_LEN + 1];
+    memcpy(one[0], window, sizeof(int) * (SEQ_LEN + 1));
+    return sess_train_batch(s, one, 1);
 }
 
 float sess_train_bytes(Session *s, const unsigned char *text, size_t len,
                        int max_windows, int verbose_every) {
-    size_t total = len;
-    if (total < (size_t)(SEQ_LEN + 1)) return 0.0f;
+    int *ids = malloc(sizeof(int) * (len + 16));
+    if (!ids) return 0.0f;
+    long ntok = tok_encode(text, len, ids, len + 15);
+    if (ntok < SEQ_LEN + 1) { free(ids); return 0.0f; }
 
-    size_t pos = 0;
-    int win_idx = 0;
+    long pos = 0;
+    int win_count = 0;
     double acc = 0.0;
-    int count = 0;
-    while (pos + SEQ_LEN + 1 <= total && win_idx < max_windows) {
-        int window[SEQ_LEN + 1];
-        tok_encode(text + pos, SEQ_LEN + 1, window, SEQ_LEN + 1);
-        acc += sess_train_window(s, window);
-        count++;
-        win_idx++;
-        pos += SEQ_LEN / 2;
-        if (verbose_every > 0 && count % verbose_every == 0)
-            printf("  [%6d] loss=%.4f ema=%.4f mem_surprise=%.3f\n", count,
-                   acc / count, s->loss_ema, s->mem->last_surprise);
+    int batches = 0;
+
+    while (pos + SEQ_LEN + 1 <= ntok && win_count < max_windows) {
+        int wins[8][SEQ_LEN + 1];
+        int nb = 0;
+        while (nb < 6 && pos + SEQ_LEN + 1 <= ntok &&
+               win_count + nb < max_windows) {
+            for (int t = 0; t < SEQ_LEN + 1; t++)
+                wins[nb][t] = ids[pos + t];
+            nb++;
+            pos += SEQ_LEN / 2;
+        }
+        if (s->use_replay && s->replay->count > 32) {
+            for (int r = 0; r < 2 && nb < 8; r++) {
+                rb_sample(s->replay, wins[nb], NULL);
+                nb++;
+            }
+        }
+        acc += sess_train_batch(s, wins, nb);
+        batches++;
+        win_count += nb;
+        if (verbose_every > 0 && batches % verbose_every == 0)
+            printf("  [%6d win] loss=%.4f ema=%.4f\n", win_count,
+                   acc / batches, s->loss_ema);
     }
-    return count ? (float)(acc / count) : 0.0f;
+    free(ids);
+    return batches ? (float)(acc / batches) : 0.0f;
 }
 
 static void sample_from_probs(const float *probs, float temperature,
@@ -153,6 +157,8 @@ void sess_generate(Session *s, const unsigned char *prompt, size_t plen,
     }
 
     size_t written = 0;
+    int gids[4096];
+    int ngid = 0;
     for (int g = 0; g < n_gen && written < outcap; g++) {
         int lo = len > SEQ_LEN ? len - SEQ_LEN : 0;
         int valid = len - lo;
@@ -208,24 +214,14 @@ void sess_generate(Session *s, const unsigned char *prompt, size_t plen,
 
         int next;
         sample_from_probs(combined, s->temperature, &next);
-        if (getenv("MEMCORE_DEBUG") && g == 0) {
-            fprintf(stderr, "[dbg] ctx tail: '");
-            for (int i = SEQ_LEN - 20; i < SEQ_LEN; i++)
-                fputc(use[i] >= 32 && use[i] < 127 ? use[i] : '.', stderr);
-            fprintf(stderr, "'\n[dbg] top5:");
-            for (int k = 0; k < 5; k++) {
-                int bi = 0;
-                for (int v = 1; v < VOCAB_SIZE; v++)
-                    if (combined[v] > combined[bi]) bi = v;
-                fprintf(stderr, " '%c'(%.3f)", bi, combined[bi]);
-                combined[bi] = -1.0f;
-            }
-            fprintf(stderr, "\n");
-        }
         if (len < 8192) stream[len++] = next;
+        if (ngid < 4096) gids[ngid++] = next;
 
-        out[written++] = (unsigned char)next;
+        if (!tok_ready()) out[written++] = (unsigned char)next;
     }
+    if (tok_ready() && ngid > 0)
+        written += tok_decode(gids, ngid, out + written,
+                              outcap > written ? outcap - written : 0);
     if (written < outcap) out[written] = '\0';
     else if (outcap > 0) out[outcap - 1] = '\0';
 }
