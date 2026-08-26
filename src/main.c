@@ -25,18 +25,16 @@ static unsigned char *read_file(const char *path, size_t *len_out) {
 }
 
 static void print_info(void) {
-    Model probe;
-    memset(&probe, 0, sizeof(probe));
-    model_init(&probe);
-    printf("MemCore\n");
+    Trainer *tp = trainer_new();
+    printf("MemCore (llama-style: RoPE, RMSNorm, SwiGLU, tied head)\n");
     printf("  vocab=%d d_model=%d heads=%d layers=%d seq=%d ff=%d mem_hidden=%d\n",
            VOCAB_SIZE, D_MODEL, N_HEADS, N_LAYERS, SEQ_LEN, FF_HIDDEN,
            MEM_HIDDEN);
     printf("  core params: %lld (%.2f MB int8 / %.2f MB fp32)\n",
-           model_param_count(&probe),
-           (float)model_param_count(&probe) / 1048576.0f,
-           (float)model_param_count(&probe) * 4.0f / 1048576.0f);
-    model_free(&probe);
+           model_param_count(&tp->m),
+           (float)model_param_count(&tp->m) / 1048576.0f,
+           (float)model_param_count(&tp->m) * 4.0f / 1048576.0f);
+    trainer_free(tp);
 }
 
 static int cmd_train(const char *file, const char *prefix, int max_windows,
@@ -68,6 +66,11 @@ static int cmd_train(const char *file, const char *prefix, int max_windows,
     printf("final loss=%.4f ema=%.4f steps=%lld surprise=%.4f\n", loss,
            s->loss_ema, s->step, s->mem->last_surprise);
 
+    char tok_path[512];
+    snprintf(tok_path, sizeof(tok_path), "%s.tok", prefix);
+    { FILE *a = fopen("data/bpe.bin", "rb"); FILE *b2 = fopen(tok_path, "wb");
+      if (a && b2) { char cp[65536]; size_t r; while ((r = fread(cp, 1, sizeof(cp), a)) > 0) fwrite(cp, 1, r, b2); }
+      if (a) fclose(a); if (b2) fclose(b2); }
     if (sess_save(s, core_path, mem_path) == 0)
         printf("saved %s.core + %s.mem\n", prefix, prefix);
     sess_free(s);
@@ -81,6 +84,12 @@ static int cmd_gen(const char *prefix, const char *prompt, int n, float temp,
     char core_path[512], mem_path[512];
     snprintf(core_path, sizeof(core_path), "%s.core", prefix);
     snprintf(mem_path, sizeof(mem_path), "%s.mem", prefix);
+    {
+        char tp[512];
+        snprintf(tp, sizeof(tp), "%s.tok", prefix);
+        if (tok_load(tp) != 0) tok_load("data/bpe.bin");
+    }
+    if (!tok_ready()) { fprintf(stderr, "error: no tokenizer found\n"); return 1; }
     if (sess_load(s, core_path, mem_path) != 0)
         printf("[no checkpoint found, using random init]\n");
     s->temperature = temp;

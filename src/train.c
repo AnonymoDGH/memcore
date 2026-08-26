@@ -62,7 +62,7 @@ float sess_train_batch(Session *s, int wins[][SEQ_LEN + 1], int nb) {
     float avg = (float)(loss / nb);
     s->loss_ema =
         s->loss_ema == 0.0 ? avg : 0.95f * s->loss_ema + 0.05f * avg;
-    s->step++;
+    s->step += nb;
     return avg;
 }
 
@@ -144,18 +144,17 @@ void sess_generate(Session *s, const unsigned char *prompt, size_t plen,
                    int use_mem) {
     int stream[8192];
     int len = 0;
+    if (plen > 2048) plen = 2048;
+    if (len < 8192) stream[len++] = '\n';
     if (s->replay->count > 0) {
         int last =
             (s->replay->head - 1 + s->replay->capacity) % s->replay->capacity;
         const int *w = s->replay->slots + (size_t)last * SEQ_LEN;
-        for (int i = 0; i < SEQ_LEN && len < 8192; i++) stream[len++] = w[i];
-    } else {
-        size_t pl2 = plen < 4096 ? plen : 4096;
-        for (size_t i = 0; i < pl2 && len < 8192; i++)
-            stream[len++] = (unsigned char)prompt[i];
-        if (len == 0) stream[len++] = ' ';
+        for (int i = 0; i < SEQ_LEN && len < 4096; i++) stream[len++] = w[i];
+        if (len < 8192) stream[len++] = '\n';
     }
-
+    for (size_t k = 0; k < plen && len < 8192; k++)
+        stream[len++] = (unsigned char)prompt[k];
     size_t written = 0;
     int gids[4096];
     int ngid = 0;
@@ -194,9 +193,19 @@ void sess_generate(Session *s, const unsigned char *prompt, size_t plen,
                    sizeof(float) * D_MODEL);
             float mem_out[VOCAB_SIZE];
             nmem_forward(s->mem, xlast, mem_out);
+            float mmax = -1e30f;
+            for (int v = 0; v < VOCAB_SIZE; v++)
+                if (mem_out[v] > mmax) mmax = mem_out[v];
+            double msum = 0.0;
             for (int v = 0; v < VOCAB_SIZE; v++) {
-                combined[v] =
-                    logf(fmaxf(p_core[v], 1e-12f)) + mem_out[v];
+                mem_out[v] = expf(mem_out[v] - mmax);
+                msum += mem_out[v];
+            }
+            for (int v = 0; v < VOCAB_SIZE; v++) {
+                float lp_core = logf(fmaxf(p_core[v], 1e-12f));
+                float lp_mem =
+                    logf(fmaxf((float)(mem_out[v] / msum), 1e-12f));
+                combined[v] = 0.85f * lp_core + 0.15f * lp_mem / 3.0f;
                 if (combined[v] > zmax) zmax = combined[v];
             }
         } else {
@@ -212,6 +221,22 @@ void sess_generate(Session *s, const unsigned char *prompt, size_t plen,
         }
         for (int v = 0; v < VOCAB_SIZE; v++) combined[v] /= sum;
 
+        if (getenv("MEMCORE_DEBUG") && g == 0) {
+            int bi[5] = {0};
+            float bc[5];
+            for (int k = 0; k < 5; k++) {
+                bi[k] = 0;
+                for (int v = 1; v < VOCAB_SIZE; v++)
+                    if (combined[v] > combined[bi[k]]) bi[k] = v;
+                bc[k] = combined[bi[k]];
+                for (int kk = 0; kk <= k; kk++) combined[bi[kk]] = -1;
+            }
+            fprintf(stderr, "[dbg] R=%d top:", R);
+            for (int k = 0; k < 5; k++) fprintf(stderr, " %d(%.3f)", bi[k], bc[k]);
+            fprintf(stderr, "\n");
+            /* restore */
+            for (int k = 0; k < 5; k++) combined[bi[k]] = bc[k];
+        }
         int next;
         sample_from_probs(combined, s->temperature, &next);
         if (len < 8192) stream[len++] = next;

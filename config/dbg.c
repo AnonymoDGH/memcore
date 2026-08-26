@@ -1,50 +1,63 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-
 #include "attention.h"
-#include "neural_mem.h"
 #include "tensor.h"
+#include "tokenizer.h"
 #include "train.h"
 
 int main(void) {
+    rng_seed(42);
     Session *s = sess_new(42);
-    if (sess_load(s, "model.core", "model.mem") != 0) {
-        printf("no checkpoint\n");
-        return 1;
+    if (tok_ensure("data/train.txt", "data/bpe.bin") != 0) return 1;
+    printf("[tok %s]\n", tok_name());
+
+    FILE *f = fopen("data/train.txt", "rb");
+    static unsigned char buf[65536];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+
+    /* train a few hundred windows IN PROCESS */
+    int *ids = malloc(sizeof(int) * (n + 16));
+    long nt = tok_encode(buf, n, ids, n + 15);
+    printf("ntok=%ld\n", nt);
+    long pos = 0;
+    float lsum = 0;
+    for (int w = 0; w < 400 && pos + SEQ_LEN + 1 <= nt; w++) {
+        int win[SEQ_LEN + 1];
+        memcpy(win, ids + pos, sizeof(int) * (SEQ_LEN + 1));
+        lsum += sess_train_window(s, win);
+        pos += SEQ_LEN / 2;
     }
-    printf("checkpoint loaded ok\n");
+    printf("avg train loss=%.3f\n", lsum / 400.0f);
 
-    const char *corpus =
-        "xxxe sol sale por la manana y el cielo se vuelve azul\n";
-    int window[SEQ_LEN];
-    int targets[SEQ_LEN];
-    int n = 0;
-    for (const char *p = corpus; *p && n < SEQ_LEN; p++)
-        window[n++] = (unsigned char)*p;
-    while (n < SEQ_LEN) window[n++] = ' ';
-    for (int t = 0; t < SEQ_LEN - 1; t++) targets[t] = window[t + 1];
-    targets[SEQ_LEN - 1] = window[SEQ_LEN - 1];
-
-    float loss = model_forward(s->core, window, targets, NULL);
-    printf("loss on known prefix: %.4f\n", loss);
-
-    for (int t = 45; t < SEQ_LEN; t++) {
-        const float *p = s->core->act.probs_final + (size_t)t * VOCAB_SIZE;
-        int best = 0;
-        for (int v = 1; v < VOCAB_SIZE; v++)
-            if (p[v] > p[best]) best = v;
-        printf("pos %2d in='%c' target='%c' argmax='%c' p=%.3f\n", t,
-               window[t], targets[t], best, p[best]);
-    }
-
-    unsigned char out[200];
-    memset(out, 0, sizeof(out));
-    printf("--- sess_generate direct call ---\n");
-    s->temperature = 0.5f;
+    /* same-process generation */
+    unsigned char out[300];
     sess_generate(s, (const unsigned char *)"el sol sale por la", 18, 60,
-                  out, 100, 0);
-    printf("gen output: [%s]\n", (char *)out);
+                  out, sizeof(out) - 1, 1);
+    out[sizeof(out) - 1] = 0;
+    printf("gen: [%s]\n", (char *)out);
 
+    /* teacher-forced: what does the model predict after real context? */
+    long q = pos - 40 > 0 ? pos - 40 : 0;
+    if (q + SEQ_LEN <= nt) {
+        int win[SEQ_LEN];
+        memcpy(win, ids + q, SEQ_LEN * sizeof(int));
+        int tg[SEQ_LEN];
+        for (int t = 0; t < SEQ_LEN - 1; t++) tg[t] = win[t + 1];
+        tg[SEQ_LEN - 1] = win[SEQ_LEN - 1];
+        model_forward(s->core, win, tg, NULL);
+        const float *pp = s->core->act.probs_final + 30 * VOCAB_SIZE;
+        int b = 0;
+        for (int v = 1; v < VOCAB_SIZE; v++)
+            if (pp[v] > pp[b]) b = v;
+        unsigned char dec[8];
+        tok_decode(&win[31], 1, dec, 8);
+        tok_decode(&b, 1, dec + 4, 4);
+        printf("t-forced@30: in='%c' -> pred_id=%d '%.*s' p=%.3f\n", dec[0],
+               b, 4, dec + 4, pp[b]);
+    }
     sess_free(s);
+    free(ids);
     return 0;
 }

@@ -23,7 +23,7 @@ NeuralMem *nmem_new(unsigned long long seed) {
     float s2 = 1.0f / sqrtf((float)MEM_HIDDEN);
     for (size_t i = 0; i < nW2; i++) nm->W2[i] = rng_normal() * s2;
 
-    nm->lr = 0.05f;
+    nm->lr = 0.02f;
     nm->decay_lambda = 2.0f;
     return nm;
 }
@@ -84,8 +84,10 @@ float nmem_surprise_update(NeuralMem *nm, const float *x, int target_token,
     float surprise = fminf(loss / 5.0f, 1.0f);
 
     float lr = nm->lr * lr_scale;
-    float decay = 1.0f - nm->decay_lambda * surprise * lr;
+    float decay = (1.0f - nm->decay_lambda * surprise * lr) *
+                  (1.0f - 2e-4f);
     if (decay < 0.0f) decay = 0.0f;
+    nm->lr = 0.02f;
 
     float gvec[VOCAB_SIZE];
     for (int v = 0; v < VOCAB_SIZE; v++)
