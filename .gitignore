@@ -17,3 +17,9 @@ data/*.txt
 .idea/
 *.swp
 Thumbs.db
+
+# checkpoints
+*.core
+*.mem
+dbg.exe
+gradcheck.exe
