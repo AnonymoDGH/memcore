@@ -9,7 +9,8 @@
 #define ADAM_B1 0.9f
 #define ADAM_B2 0.999f
 #define ADAM_EPS 1e-8f
-#define MAX_PARAMS 64
+#define MAX_PARAMS_USED (2 + N_LAYERS * 16 + 3)
+#define MAX_PARAMS MAX_PARAMS_USED
 
 static float gelu(float x) {
     return 0.5f * x * (1.0f + tanhf(GELU_C * (x + 0.044715f * x * x * x)));
@@ -441,6 +442,56 @@ long long model_param_count(const Model *mo) {
     for (int i = 0; i < n; i++)
         total += (long long)lst[i]->rows * lst[i]->cols;
     return total;
+}
+
+#define CORE_MAGIC 0x4D434F52u
+
+int model_save(const Model *mo, const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    unsigned magic = CORE_MAGIC, count = MAX_PARAMS_USED;
+    fwrite(&magic, sizeof(magic), 1, f);
+    fwrite(&count, sizeof(count), 1, f);
+    Mat *lst[MAX_PARAMS];
+    int n = 0;
+    collect((Model *)mo, lst, &n);
+    for (int i = 0; i < n; i++) {
+        int rc[2] = {lst[i]->rows, lst[i]->cols};
+        fwrite(rc, sizeof(int), 2, f);
+        fwrite(lst[i]->data, sizeof(float), (size_t)rc[0] * rc[1], f);
+    }
+    fclose(f);
+    return 0;
+}
+
+int model_load(Model *mo, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    unsigned magic = 0, count = 0;
+    fread(&magic, sizeof(magic), 1, f);
+    fread(&count, sizeof(count), 1, f);
+    if (magic != CORE_MAGIC || count != MAX_PARAMS_USED) {
+        fclose(f);
+        return -1;
+    }
+    Mat *lst[MAX_PARAMS];
+    int n = 0;
+    collect(mo, lst, &n);
+    for (int i = 0; i < n; i++) {
+        int rc[2];
+        if (fread(rc, sizeof(int), 2, f) != 2 ||
+            fread(lst[i]->data, sizeof(float), (size_t)rc[0] * rc[1], f) !=
+                (size_t)rc[0] * rc[1]) {
+            fclose(f);
+            return -1;
+        }
+        if (rc[0] != lst[i]->rows || rc[1] != lst[i]->cols) {
+            fclose(f);
+            return -1;
+        }
+    }
+    fclose(f);
+    return 0;
 }
 
 void model_zero_grads(Trainer *tr) {

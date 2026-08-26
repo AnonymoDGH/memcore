@@ -59,6 +59,8 @@ void model_init(Model *mo);
 void model_zero(Model *mo);
 void model_free(Model *mo);
 long long model_param_count(const Model *mo);
+int model_save(const Model *mo, const char *path);
+int model_load(Model *mo, const char *path);
 
 void act_alloc(Activations *a);
 void act_free(Activations *a);
