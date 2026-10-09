@@ -25,6 +25,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 # ----------------------------------------------------------------- tasks
 
@@ -166,6 +167,7 @@ class Net(nn.Module):
         self.emb = nn.Embedding(256, d)
         self.loop_emb = nn.Parameter(torch.zeros(loops, d))
         self.blocks = nn.ModuleList(Block(d, heads, ff) for _ in range(blocks))
+        self.grad_ckpt = False  # recompute activations in backward (big models)
         self.norm = nn.RMSNorm(d)
         hd = d // heads
         inv = 10000 ** (-torch.arange(0, hd // 2) / (hd // 2))
@@ -185,7 +187,10 @@ class Net(nn.Module):
         for r in range(loops):
             x = x + self.loop_emb[r]
             for blk in self.blocks:
-                x = blk(x, cos, sin, mask)
+                if self.grad_ckpt and self.training:
+                    x = checkpoint(blk, x, cos, sin, mask, use_reentrant=False)
+                else:
+                    x = blk(x, cos, sin, mask)
         h = self.norm(x)
         logits = h @ self.emb.weight.t()
         return (logits, h) if hidden else logits
@@ -406,17 +411,20 @@ class Trainer:
         threading.Thread(target=producer, daemon=True).start()
         t0, tok, lsum = time.time(), 0, 0.0
         for s in range(1, steps + 1):
-            lr = a.lr * min(1, s / 300) * (0.1 + 0.45 * (1 + math.cos(math.pi * s / steps)))
+            lr = a.lr * min(1, s / a.warmup) * (0.1 + 0.45 * (1 + math.cos(math.pi * s / steps)))
             for g in opt.param_groups:
                 g["lr"] = lr
+            loops = L if random.random() < 0.7 else random.randint(1, L)
+            opt.zero_grad(set_to_none=True)
             x, y = q.get()
             x, y = x.to(a.dev, non_blocking=True), y.to(a.dev, non_blocking=True)
-            loops = L if random.random() < 0.7 else random.randint(1, L)
-            with torch.autocast("cuda", dtype=torch.float16, enabled=a.dev == "cuda"):
-                lg = net(x, loops)
-                loss = F.cross_entropy(lg.float().view(-1, 256), y.view(-1), ignore_index=-100)
-            opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
+            mb = max(1, a.batch // a.accum)
+            for i in range(0, a.batch, mb):
+                with torch.autocast("cuda", dtype=torch.float16, enabled=a.dev == "cuda"):
+                    lg = net(x[i:i + mb], loops)
+                    loss = F.cross_entropy(lg.float().view(-1, 256), y[i:i + mb].reshape(-1),
+                                           ignore_index=-100)
+                scaler.scale(loss * mb / a.batch).backward()
             scaler.unscale_(opt)
             nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             scaler.step(opt)
@@ -479,6 +487,9 @@ def main():
     ap.add_argument("--blocks", type=int, default=4)
     ap.add_argument("--loops", type=int, default=3)
     ap.add_argument("--ff", type=int, default=1024)
+    ap.add_argument("--accum", type=int, default=1, help="micro-batches per step")
+    ap.add_argument("--grad-ckpt", action="store_true")
+    ap.add_argument("--warmup", type=int, default=300)
     ap.add_argument("--text")
     ap.add_argument("--text-mix", type=float, default=0.3)
     ap.add_argument("--memory", help="text file memorized before gen")
@@ -499,6 +510,7 @@ def main():
         else:
             net = Net(a.d, a.heads, a.blocks, a.loops, a.ff, max(160, a.T)).to(a.dev)
             levels = None
+        net.grad_ckpt = a.grad_ckpt
         text = open(a.text, "rb").read() if a.text else None
         print(f"params {sum(p.numel() for p in net.parameters()):,}  cfg {net.cfg}  device {a.dev}")
         Trainer(net, a, levels, text).run(a.steps, a.ckpt)
