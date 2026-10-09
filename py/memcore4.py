@@ -329,8 +329,9 @@ def generate(net, prompt, n=200, temp=0.0, mem=None):
 
 
 class Trainer:
-    def __init__(self, net, args, levels=None, text=None):
+    def __init__(self, net, args, levels=None, text=None, opt_state=None, step0=0):
         self.net, self.a = net, args
+        self.opt_state, self.step0 = opt_state, step0
         self.levels = levels or {t: 1 for t in TASKS}
         self.hard = collections.deque(maxlen=4096)  # failed problems
         self.self_ = collections.deque(maxlen=4096)  # STaR: solved frontier
@@ -368,19 +369,26 @@ class Trainer:
         y = torch.tensor([r[1] for r in rows])
         return x.to(self.a.dev, non_blocking=True), y.to(self.a.dev, non_blocking=True)
 
-    def curriculum(self, n=128):
+    def curriculum(self, n=128, max_jump=3):
+        """Evaluate each task at its level; climb while mastered (up to
+        max_jump levels per call) so strong models are not held back."""
         net = self.net
         net.eval()
         line = []
         for t in TASKS:
+            acc, star = 0.0, 0
+            for _ in range(max_jump):
+                L = self.levels[t]
+                ps = [task_gen(t, L) for _ in range(n)]
+                ans, _ = answer(net, ps)
+                ok = [solve(p) == a for p, a in zip(ps, ans)]
+                self.hard.extend(p for p, o in zip(ps, ok) if not o)
+                acc = sum(ok) / n
+                if acc < 0.9 or L >= TASKS[t]:
+                    break
+                self.levels[t] = L + 1
             L = self.levels[t]
-            ps = [task_gen(t, L) for _ in range(n)]
-            ans, _ = answer(net, ps)
-            ok = [solve(p) == a for p, a in zip(ps, ans)]
-            self.hard.extend(p for p, o in zip(ps, ok) if not o)
-            acc = sum(ok) / n
-            star = 0
-            if L < TASKS[t]:  # STaR: attempt the next level, keep verified
+            if L < TASKS[t] and acc < 0.9:  # STaR: attempt next level, keep verified
                 fp = [task_gen(t, L + 1) for _ in range(64)]
                 for _ in range(2):
                     fa, _ = answer(net, fp, temp=0.8)
@@ -388,8 +396,6 @@ class Trainer:
                     self.self_.extend(good)
                     star += len(good)
             line.append(f"{t}@{L}={acc:.0%}" + (f"(+{star})" if star else ""))
-            if acc >= 0.9 and L < TASKS[t]:
-                self.levels[t] = L + 1
         net.train()
         return " ".join(line)
 
@@ -397,6 +403,8 @@ class Trainer:
         net, a = self.net, self.a
         opt = torch.optim.AdamW(net.parameters(), lr=a.lr, betas=(0.9, 0.95),
                                 weight_decay=0.05, fused=a.dev == "cuda")
+        if self.opt_state is not None:
+            opt.load_state_dict(self.opt_state)
         scaler = torch.amp.GradScaler(enabled=a.dev == "cuda")
         L = net.cfg["loops"]
         # build batches on the CPU while the GPU trains (pinned, async copy)
@@ -438,20 +446,26 @@ class Trainer:
             if s % a.eval_every == 0 or s == steps:
                 print("  curriculum: " + self.curriculum() +
                       f"  hard={len(self.hard)} self={len(self.self_)}", flush=True)
-                save(net, self.levels, ckpt)
+            if s % a.save_every == 0 or s == steps:
+                save(net, self.levels, ckpt, opt, self.step0 + s)
 
 # ----------------------------------------------------------------- io / cli
 
 
-def save(net, levels, path):
-    torch.save({"cfg": net.cfg, "model": net.state_dict(), "levels": levels}, path + ".tmp")
+def save(net, levels, path, opt=None, step=0):
+    ck = {"cfg": net.cfg, "model": net.state_dict(), "levels": levels, "step": step}
+    if opt is not None:
+        ck["opt"] = opt.state_dict()
+    torch.save(ck, path + ".tmp")
     os.replace(path + ".tmp", path)
 
 
-def load(path, dev):
+def load(path, dev, full=False):
     ck = torch.load(path, map_location=dev)
     net = Net(**ck["cfg"]).to(dev)
     net.load_state_dict(ck["model"])
+    if full:
+        return net, ck["levels"], ck.get("opt"), ck.get("step", 0)
     return net, ck["levels"]
 
 
@@ -490,6 +504,7 @@ def main():
     ap.add_argument("--accum", type=int, default=1, help="micro-batches per step")
     ap.add_argument("--grad-ckpt", action="store_true")
     ap.add_argument("--warmup", type=int, default=300)
+    ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--text")
     ap.add_argument("--text-mix", type=float, default=0.3)
     ap.add_argument("--memory", help="text file memorized before gen")
@@ -504,16 +519,17 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
 
     if a.cmd == "train":
+        opt_state, step0 = None, 0
         if os.path.exists(a.ckpt):
-            net, levels = load(a.ckpt, a.dev)
-            print(f"[resuming {a.ckpt}]")
+            net, levels, opt_state, step0 = load(a.ckpt, a.dev, full=True)
+            print(f"[resuming {a.ckpt} at step {step0}, levels {levels}]")
         else:
             net = Net(a.d, a.heads, a.blocks, a.loops, a.ff, max(160, a.T)).to(a.dev)
             levels = None
         net.grad_ckpt = a.grad_ckpt
         text = open(a.text, "rb").read() if a.text else None
         print(f"params {sum(p.numel() for p in net.parameters()):,}  cfg {net.cfg}  device {a.dev}")
-        Trainer(net, a, levels, text).run(a.steps, a.ckpt)
+        Trainer(net, a, levels, text, opt_state, step0).run(a.steps, a.ckpt)
         return
 
     net, levels = load(a.ckpt, a.dev)
