@@ -1,4 +1,22 @@
-# MemCore v3
+# MemCore
+
+Dos motores con el mismo diseño:
+
+| Versión | Dónde | Tamaño | Velocidad |
+|---------|-------|--------|-----------|
+| **v4** (`py/memcore4.py`, PyTorch) | GPU (Colab T4) | 7.2M parámetros, 4 bloques × 3 bucles (profundidad 12) | ~65k tokens/s |
+| **v3** (`src/`, C puro) | CPU | 673k parámetros, 3 bloques × 2 bucles | ~10.8k tokens/s |
+
+v4 añade tareas más difíciles (`mul2`: n×n dígitos, `chain`: a+b−c),
+embedding por bucle, decodificación por lotes y entrenamiento fp16.
+
+```sh
+python py/memcore4.py train --steps 12000      # GPU
+python py/memcore4.py eval --votes 5
+python py/memcore4.py solve "4821+977"
+```
+
+## MemCore v3 (C)
 
 Modelos pequeños que aprenden mucho con pocos datos. 100% C (OpenMP + AVX),
 sin dependencias, entrena en CPU.
