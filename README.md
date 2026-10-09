@@ -1,112 +1,67 @@
-# MemCore
+# MemCore v3
 
-Micro-modelo de generación de texto que **aprende continuamente** con pocos datos,
-diseñado para hardware mínimo (8 GB RAM, poco disco) e implementado **100% en C**.
+Modelos pequeños que aprenden mucho con pocos datos. 100% C (OpenMP + AVX),
+sin dependencias, entrena en CPU.
 
-## Idea central
-
-El conocimiento nuevo **no vive en los pesos del núcleo**, sino en una
-**memoria neuronal a largo plazo** que se actualiza en runtime mediante una
-métrica de *sorpresa* (inspirado en *Titans: Learning to Memorize at Test Time*,
-Google Research 2025 — arxiv.org/abs/2501.00663).
+Diseño derivado de un autoanálisis de las debilidades de los LLM actuales
+(`docs/AUTOANALISIS.md`): cada debilidad tiene un mecanismo concreto aquí.
 
 ```
-token ──> [Atención local pequeña] ──┬──> logits ──> predicción
-              │                      ▲
-              ▼                      │ suma proyectada
-        [Memoria Neuronal MLP] ──────┘
-              ▲
-        actualización ONLINE por gradiente de sorpresa:
-        M_t = M_(t-1)·(1 − λ·sorpresa) + lr · ∇(pérdida_local)
+                 ┌─────────────── datos sintéticos verificables ───────────────┐
+                 │  generador → currículo adaptativo → minado de errores → STaR │
+                 └──────────────────────────────┬──────────────────────────────┘
+                                                ▼
+ bytes ─► [ bloque 1 ─ bloque 2 ─ bloque 3 ] ×  1..N bucles  ─► logits
+             pesos compartidos: profundidad variable (cómputo adaptativo)
+                                                │
+               inferencia: superficial → si duda, más profunda → votación
+                                                │
+                       memoria episódica kNN (aprende texto al instante)
 ```
 
-- **Sorpresa = |gradiente| de la pérdida del token actual respecto a la memoria.**
-  Token esperado → gradiente ≈ 0 → no se gasta cómputo.
-  Token nuevo/raro → se memoriza al vuelo mientras se lee.
-- **Anti-olvido catastrófico**: decay λ + replay buffer circular re-muestreado
-  cada N pasos (validado por arxiv.org/abs/2504.17780 y arXiv:2402.18865).
-- **Sin Python**: patrón de entrenamiento manual inspirado en llm.c
-  (github.com/karpathy/llm.c): forward + backward + Adam escritos a mano.
+## Mecanismos
 
-## Presupuesto de recursos
+| Mecanismo | Qué resuelve | Dónde |
+|-----------|--------------|-------|
+| Transformer en bucle (bloques compartidos, RoPE, RMSNorm, SwiGLU, embeddings atados) | Más profundidad por parámetro | `src/model.c` |
+| Entrenamiento con nº de bucles aleatorio | El mismo modelo funciona superficial o profundo | `src/train.c` |
+| Profundidad adaptativa en inferencia | Piensa más solo cuando duda (confianza < 0.9) | `src/infer.c` |
+| Tareas verificables + solucionador de referencia | Datos infinitos y exactos; verificador para todo | `src/tasks.c` |
+| Dígitos en orden de acarreo (LSB primero) | La suma se vuelve local y aprendible | `src/tasks.c` |
+| Currículo adaptativo (sube nivel al 90%) | No gasta datos en lo dominado | `src/train.c` |
+| Minado de errores | Cada fallo en evaluación vuelve al entrenamiento | `src/train.c` |
+| STaR en la frontera | Intenta el nivel siguiente; entrena solo lo verificado | `src/train.c` |
+| Votación + "no estoy seguro" | Más cómputo en inferencia, calibración | `src/infer.c` |
+| Memoria episódica kNN | Aprende hechos nuevos sin gradientes | `src/memory.c` |
+| Pérdida solo en respuestas, ejemplos empaquetados | Cada token de cómputo enseña algo | `src/train.c` |
 
-| Componente            | Costo                          |
-|-----------------------|--------------------------------|
-| Núcleo atención       | ~10M params int8 (~10 MB mmap) |
-| Memoria neuronal MLP  | ~2M params fp32 (~8 MB RAM)    |
-| Replay buffer         | ~5 MB                          |
-| Total en entrenamiento| < 300 MB RAM                   |
-
-## Módulos
-
-| Archivo             | Rol                                                        |
-|---------------------|------------------------------------------------------------|
-| `src/tokenizer.c`   | Tokenizador byte-level (256 vocab, sin BPE todavía)        |
-| `src/tensor.c`      | Utilidades base: alloc, matmul, softmax, layernorm         |
-| `src/attention.c`   | Núcleo transformer pequeño (forward + backward)            |
-| `src/neural_mem.c`  | Memoria neuronal con métrica de sorpresa (aprendizaje online) |
-| `src/replay.c`      | Replay buffer circular anti-olvido                         |
-| `src/train.c`       | Bucle de entrenamiento continuo                            |
-| `src/main.c`        | Demo end-to-end                                            |
-
-## Compilar
-
-```sh
-gcc -O2 -Wall -Wextra -std=c11 -Isrc -o memcore.exe \
-    src/tensor.c src/tokenizer.c src/attention.c src/neural_mem.c \
-    src/replay.c src/train.c src/main.c -lm
-```
+Tareas: `add`, `sub`, `mul` (×1 dígito), `cmp`, `rev`, `sort`, `count`.
 
 ## Uso
 
 ```sh
-./memcore info                          # arquitectura y nº de parámetros
-./memcore train data.txt -n 3000        # aprendizaje continuo (resume si hay checkpoint)
-./memcore gen "el sol" 140              # generar (usa model.core/model.mem)
-    -t 0.5   temperatura                -m 0/1  memoria neuronal on/off
-./memcore chat                          # REPL: aprende tu línea ANTES de responder
-    :save :exit :temp 0.7
+make && make test                 # compila + gradcheck + kv-cache check
+./memcore train -s 6000           # entrena (reanuda si existe model.mc)
+./memcore eval -n 100             # precisión por tarea y nivel (+2 niveles nunca vistos)
+./memcore solve "4821+977"        # resuelve con profundidad adaptativa
+./memcore solve "4821+977" -k 9   # con votación de 9 muestras
+./memcore chat                    # resuelve tareas; memoriza cualquier otra línea
+./memcore train --text corpus.txt --mix 0.3   # mezcla modelado de texto
+./memcore learn notas.txt         # memoria episódica desde archivo
+./memcore gen "prompt" -m memory.knn
 ```
 
-El entrenamiento es **incremental**: cada pasada por `train` reanuda desde el
-checkpoint (`model.core` + `model.mem`), así que puedes alimentarlo con archivos
-nuevos sin reentrenar desde cero.
+Configuración por defecto: d=128, 4 cabezas, 3 bloques × 2 bucles
+(profundidad 6), ff=384, 673k parámetros.
 
 ## Verificación
 
-`config/test.c` hace **gradient check numérico** del backward completo
-(diferencias centrales vs gradiente analítico en 8 tensores):
+- `make test`: gradiente numérico vs analítico en todos los tensores
+  (incluido el reuso de bloques), y decodificación con KV-cache contra el
+  forward en batch.
+- `memcore eval` mide sobre problemas nuevos aleatorios; las columnas con `*`
+  son longitudes mayores que cualquiera vista en entrenamiento.
 
-```sh
-gcc -g -O0 -Wall -std=c11 -Isrc -o gradcheck.exe config/test.c \
-    src/tensor.c src/tokenizer.c src/attention.c src/neural_mem.c \
-    src/replay.c src/train.c -lm && ./gradcheck.exe
-```
+## Resultados
 
-## Resultados actuales
-
-- Corpus demo (10 líneas en español, ~18 KB): loss 4.3 → **0.44** en 3 pasadas.
-- Generación coherente con el corpus: `"el sol sale por la"` → `" manana…"`.
-- La memoria neuronal muestra sorpresa adaptativa (se calma con texto esperable,
-  se activa con contenido nuevo).
-
-## Lecciones de implementación (hard-won)
-
-1. Los buffers de gradiente que acumulan con `+=` deben inicializarse a cero
-   (memoria no inicializada → NaNs silenciosos → divergencia).
-2. Sin clipping de norma global, Adam a 3e-4 diverge en este micro-modelo;
-   con clip a 1.0, converge estable.
-3. En generación, la predicción debe leerse en la **posición del último token
-   válido**: la atención causal hace que el padding posterior sea inerte.
-4. Contextos sintéticos (padding masivo, prompts repetidos) descarrilan al
-   modelo; sembrar desde el replay buffer mantiene la distribución real.
-
-## Estado
-
-- [x] Núcleo transformer con forward/backward/Adam en C puro
-- [x] Memoria neuronal con escritura por sorpresa + persistencia
-- [x] Replay buffer anti-olvido
-- [x] Gradient check numérico verde
-- [x] Entrenamiento continuo incremental entre sesiones
-- [ ] Cuantización int8 de pesos (hoy fp32)
-- [ ] KV-cache para generación incremental
+Ver la sección de resultados en `docs/RESULTADOS.md`.

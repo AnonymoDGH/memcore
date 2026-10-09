@@ -1,33 +1,26 @@
-#ifndef MEMCORE_TENSOR_H
-#define MEMCORE_TENSOR_H
+#ifndef MC_TENSOR_H
+#define MC_TENSOR_H
 
 #include <stddef.h>
+#include <stdint.h>
 
-typedef struct {
-    int rows;
-    int cols;
-    float *data;
-} Mat;
-
-Mat *mat_new(int rows, int cols);
-void mat_free(Mat *m);
-void mat_fill(Mat *m, float v);
-void mat_randn(Mat *m, float scale);
-float mat_at(const Mat *m, int r, int c);
-void mat_set(Mat *m, int r, int c, float v);
-
-void mat_mul(Mat *out, const Mat *a, const Mat *b);
-void mat_add_row(Mat *m, int row, const float *v, int n);
-void vec_add(float *dst, const float *src, int n);
-void vec_scale(float *v, int n, float s);
-
-void softmax_inplace(float *x, int n);
-void layer_norm(float *out, const float *in, const float *gamma,
-                const float *beta, int n);
-
-extern unsigned long long rng_state;
-void rng_seed(unsigned long long seed);
+void rng_seed(uint64_t s);
+uint64_t rng_u64(void);
+float rng_uniform(void); /* [0,1) */
 float rng_normal(void);
-float rng_uniform(void);
+int rng_int(int n); /* [0,n) */
+
+/* zeroed, 64-byte aligned */
+float *falloc(size_t n);
+
+/* y[N,out] (= or +=) x[N,in] @ W[in,out] */
+void mm_fwd(float *y, const float *x, const float *W, int N, int in, int out,
+            int acc);
+/* y[N,in] (= or +=) x[N,out] @ W[in,out]^T */
+void mm_bt(float *y, const float *x, const float *W, int N, int in, int out,
+           int acc);
+/* dW[in,out] += x[N,in]^T @ dy[N,out] */
+void mm_wgrad(float *dW, const float *x, const float *dy, int N, int in,
+              int out);
 
 #endif

@@ -23,3 +23,7 @@ Thumbs.db
 *.mem
 dbg.exe
 gradcheck.exe
+gradcheck
+*.mc
+*.mc.tmp
+*.knn

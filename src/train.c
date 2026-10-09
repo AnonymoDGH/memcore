@@ -1,267 +1,186 @@
 #include "train.h"
 
 #include <math.h>
+#include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "infer.h"
+#include "tasks.h"
 #include "tensor.h"
-#include "tokenizer.h"
 
-static int dummy_targets[SEQ_LEN];
+#define PCAP 48
+#define BUF_CAP 2048
+#define MASTERY 0.9f
+#define EVAL_N 64
+#define STAR_N 32
 
-Session *sess_new(unsigned long long seed) {
-    rng_seed(seed);
-    Session *s = calloc(1, sizeof(Session));
-    s->core = trainer_new();
-    s->mem = nmem_new(seed ^ 0xB5297A4DULL);
-    s->replay = rb_new(512);
-    s->core_lr = 3e-4f;
-    s->mem_lr_scale = 1.0f;
-    s->temperature = 0.8f;
-    s->use_replay = 1;
-    s->use_mem = 1;
-    return s;
+typedef struct {
+    char p[BUF_CAP][PCAP];
+    int n, head;
+} Ring;
+
+static Ring g_hard; /* problems the model failed: hard-example mining */
+static Ring g_self; /* frontier problems it solved itself (STaR) */
+
+static void ring_push(Ring *r, const char *p) {
+    snprintf(r->p[r->head], PCAP, "%s", p);
+    r->head = (r->head + 1) % BUF_CAP;
+    if (r->n < BUF_CAP) r->n++;
 }
 
-void sess_free(Session *s) {
-    if (!s) return;
-    trainer_free(s->core);
-    nmem_free(s->mem);
-    rb_free(s->replay);
-    free(s);
+static int *levels(Model *M) {
+    for (int t = 0; t < T_COUNT; t++)
+        if (M->meta[t] < 1) M->meta[t] = 1;
+    return M->meta;
 }
 
-static void shift_targets(const int *window, int *tgt) {
-    for (int t = 0; t < SEQ_LEN - 1; t++) tgt[t] = window[t + 1];
-    tgt[SEQ_LEN - 1] = window[SEQ_LEN - 1];
-}
-
-float sess_train_batch(Session *s, int wins[][SEQ_LEN + 1], int nb) {
-    Trainer *tr = s->core;
-    Activations *a = &tr->act;
-
-    model_zero_grads(tr);
-    double loss = 0.0;
-    for (int k = 0; k < nb; k++) {
-        shift_targets(wins[k], dummy_targets);
-        loss += model_forward(tr, wins[k], dummy_targets, NULL);
-        model_backward(tr, wins[k], dummy_targets);
-
-        for (int t = 0; t < SEQ_LEN; t++) {
-            int tgt = (t + 1 < SEQ_LEN) ? wins[k][t + 1] : wins[k][t];
-            nmem_surprise_update(s->mem, a->x_final + t * D_MODEL, tgt,
-                                 s->mem_lr_scale);
-        }
-        rb_push(s->replay, wins[k]);
+static void sample_example(Model *M, char *prompt, char *ans) {
+    float r = rng_uniform();
+    if (r < 0.15f && g_hard.n) {
+        snprintf(prompt, PCAP, "%s", g_hard.p[rng_int(g_hard.n)]);
+    } else if (r < 0.25f && g_self.n) {
+        snprintf(prompt, PCAP, "%s", g_self.p[rng_int(g_self.n)]);
+    } else {
+        int t = rng_int(T_COUNT), L = levels(M)[t];
+        int lv = rng_uniform() < 0.6f ? L : 1 + rng_int(L);
+        task_gen(t, lv, prompt, PCAP);
     }
-
-    model_clip_grads(tr, 1.0f);
-    float warm = fminf(1.0f, (float)(s->step + 1) / 300.0f);
-    model_adam_step(tr, s->core_lr * warm);
-
-    float avg = (float)(loss / nb);
-    s->loss_ema =
-        s->loss_ema == 0.0 ? avg : 0.95f * s->loss_ema + 0.05f * avg;
-    s->step += nb;
-    return avg;
+    task_solve(prompt, ans, PCAP);
 }
 
-float sess_train_window(Session *s, const int *window) {
-    int one[1][SEQ_LEN + 1];
-    memcpy(one[0], window, sizeof(int) * (SEQ_LEN + 1));
-    return sess_train_batch(s, one, 1);
-}
-
-float sess_train_bytes(Session *s, const unsigned char *text, size_t len,
-                       int max_windows, int verbose_every) {
-    int *ids = malloc(sizeof(int) * (len + 16));
-    if (!ids) return 0.0f;
-    long ntok = tok_encode(text, len, ids, len + 15);
-    if (ntok < SEQ_LEN + 1) { free(ids); return 0.0f; }
-
-    long pos = 0;
-    int win_count = 0;
-    double acc = 0.0;
-    int batches = 0;
-
-    while (pos + SEQ_LEN + 1 <= ntok && win_count < max_windows) {
-        int wins[8][SEQ_LEN + 1];
-        int nb = 0;
-        while (nb < 6 && pos + SEQ_LEN + 1 <= ntok &&
-               win_count + nb < max_windows) {
-            for (int t = 0; t < SEQ_LEN + 1; t++)
-                wins[nb][t] = ids[pos + t];
-            nb++;
-            pos += SEQ_LEN / 2;
-        }
-        if (s->use_replay && s->replay->count > 32) {
-            for (int r = 0; r < 2 && nb < 8; r++) {
-                rb_sample(s->replay, wins[nb], NULL);
-                nb++;
-            }
-        }
-        acc += sess_train_batch(s, wins, nb);
-        batches++;
-        win_count += nb;
-        if (verbose_every > 0 && batches % verbose_every == 0)
-            printf("  [%6d win] loss=%.4f ema=%.4f\n", win_count,
-                   acc / batches, s->loss_ema);
-    }
-    free(ids);
-    return batches ? (float)(acc / batches) : 0.0f;
-}
-
-static void sample_from_probs(const float *probs, float temperature,
-                              int *out_tok) {
-    if (temperature <= 0.01f) {
-        int best = 0;
-        for (int v = 1; v < VOCAB_SIZE; v++)
-            if (probs[v] > probs[best]) best = v;
-        *out_tok = best;
-        return;
-    }
-    float scaled[VOCAB_SIZE];
-    float sum = 0.0f;
-    float inv_t = 1.0f / temperature;
-    for (int v = 0; v < VOCAB_SIZE; v++) {
-        scaled[v] = powf(probs[v], inv_t);
-        sum += scaled[v];
-    }
-    float r = rng_uniform() * sum;
-    float cdf = 0.0f;
-    for (int v = 0; v < VOCAB_SIZE; v++) {
-        cdf += scaled[v];
-        if (r <= cdf) {
-            *out_tok = v;
-            return;
+static void fill_row(Model *M, const TrainOpts *o, int *tok, int *tgt) {
+    int T = o->T, s[MC_MAXT + 1], len = 0;
+    char m[MC_MAXT + 1];
+    if (o->text && o->text_len > (size_t)T + 1 && rng_uniform() < o->text_mix) {
+        size_t st = (size_t)(rng_u64() % (o->text_len - (size_t)T - 1));
+        for (int i = 0; i <= T; i++) { s[i] = o->text[st + i]; m[i] = 1; }
+    } else {
+        s[len] = '\n'; m[len++] = 0;
+        while (len <= T) {
+            char p[PCAP], a[PCAP];
+            sample_example(M, p, a);
+            for (char *c = p; *c && len <= T; c++) { s[len] = (unsigned char)*c; m[len++] = 0; }
+            for (char *c = a; *c && len <= T; c++) { s[len] = (unsigned char)*c; m[len++] = 1; }
+            if (len <= T) { s[len] = '\n'; m[len++] = 1; }
         }
     }
-    *out_tok = VOCAB_SIZE - 1;
+    for (int i = 0; i < T; i++) {
+        tok[i] = s[i];
+        tgt[i] = m[i + 1] ? s[i + 1] : -1;
+    }
 }
 
-void sess_generate(Session *s, const unsigned char *prompt, size_t plen,
-                   int n_gen, unsigned char *out, size_t outcap,
-                   int use_mem) {
-    int stream[8192];
-    int len = 0;
-    if (plen > 2048) plen = 2048;
-    if (len < 8192) stream[len++] = '\n';
-    if (s->replay->count > 0) {
-        int last =
-            (s->replay->head - 1 + s->replay->capacity) % s->replay->capacity;
-        const int *w = s->replay->slots + (size_t)last * SEQ_LEN;
-        for (int i = 0; i < SEQ_LEN && len < 4096; i++) stream[len++] = w[i];
-        if (len < 8192) stream[len++] = '\n';
-    }
-    for (size_t k = 0; k < plen && len < 8192; k++)
-        stream[len++] = (unsigned char)prompt[k];
-    size_t written = 0;
-    int gids[4096];
-    int ngid = 0;
-    for (int g = 0; g < n_gen && written < outcap; g++) {
-        int lo = len > SEQ_LEN ? len - SEQ_LEN : 0;
-        int valid = len - lo;
-        int un = 0;
-        int use[SEQ_LEN];
-        for (int i = lo; i < len; i++) use[un++] = stream[i];
-        while (un < SEQ_LEN) use[un++] = ' ';
-        int R = valid - 1;
-
-        int dtargets[SEQ_LEN];
-        for (int t = 0; t < SEQ_LEN - 1; t++) dtargets[t] = use[t + 1];
-        dtargets[SEQ_LEN - 1] = use[SEQ_LEN - 1];
-
-        model_forward(s->core, use, dtargets, NULL);
-
-        const float *p_core =
-            s->core->act.probs_final + (size_t)R * VOCAB_SIZE;
-        if (getenv("MEMCORE_DEBUG") && g == 0) {
-            float lchk = 0.0f;
-            for (int t = 0; t < SEQ_LEN; t++) {
-                const float *pp =
-                    s->core->act.probs_final + (size_t)t * VOCAB_SIZE;
-                lchk -= logf(fmaxf(pp[dtargets[t]], 1e-10f));
-            }
-            fprintf(stderr, "[dbg] R=%d len=%d ce_last=%.3f\n", R, len,
-                    lchk / SEQ_LEN);
-        }
-        float combined[VOCAB_SIZE];
-        float zmax = -1e30f;
-        if (use_mem) {
-            float xlast[D_MODEL];
-            memcpy(xlast, s->core->act.x_final + (size_t)R * D_MODEL,
-                   sizeof(float) * D_MODEL);
-            float mem_out[VOCAB_SIZE];
-            nmem_forward(s->mem, xlast, mem_out);
-            float mmax = -1e30f;
-            for (int v = 0; v < VOCAB_SIZE; v++)
-                if (mem_out[v] > mmax) mmax = mem_out[v];
-            double msum = 0.0;
-            for (int v = 0; v < VOCAB_SIZE; v++) {
-                mem_out[v] = expf(mem_out[v] - mmax);
-                msum += mem_out[v];
-            }
-            for (int v = 0; v < VOCAB_SIZE; v++) {
-                float lp_core = logf(fmaxf(p_core[v], 1e-12f));
-                float lp_mem =
-                    logf(fmaxf((float)(mem_out[v] / msum), 1e-12f));
-                combined[v] = 0.85f * lp_core + 0.15f * lp_mem / 3.0f;
-                if (combined[v] > zmax) zmax = combined[v];
-            }
+static float eval_level(Model *M, KV *kv, int task, int level, int n,
+                        int adaptive, int votes, Ring *fails, float *avg_loops) {
+    int ok = 0;
+    float loops = 0;
+    for (int i = 0; i < n; i++) {
+        char p[PCAP];
+        task_gen(task, level, p, PCAP);
+        Solution s;
+        if (adaptive) {
+            infer_solve(M, kv, p, votes, &s);
         } else {
-            for (int v = 0; v < VOCAB_SIZE; v++) {
-                combined[v] = logf(fmaxf(p_core[v], 1e-12f));
-                if (combined[v] > zmax) zmax = combined[v];
-            }
+            infer_answer(M, kv, p, M->c.loops, 0, s.ans, sizeof(s.ans), NULL);
+            s.loops = M->c.loops;
         }
-        float sum = 0.0f;
-        for (int v = 0; v < VOCAB_SIZE; v++) {
-            combined[v] = expf(combined[v] - zmax);
-            sum += combined[v];
-        }
-        for (int v = 0; v < VOCAB_SIZE; v++) combined[v] /= sum;
-
-        if (getenv("MEMCORE_DEBUG") && g == 0) {
-            int bi[5] = {0};
-            float bc[5];
-            for (int k = 0; k < 5; k++) {
-                bi[k] = 0;
-                for (int v = 1; v < VOCAB_SIZE; v++)
-                    if (combined[v] > combined[bi[k]]) bi[k] = v;
-                bc[k] = combined[bi[k]];
-                for (int kk = 0; kk <= k; kk++) combined[bi[kk]] = -1;
-            }
-            fprintf(stderr, "[dbg] R=%d top:", R);
-            for (int k = 0; k < 5; k++) fprintf(stderr, " %d(%.3f)", bi[k], bc[k]);
-            fprintf(stderr, "\n");
-            /* restore */
-            for (int k = 0; k < 5; k++) combined[bi[k]] = bc[k];
-        }
-        int next;
-        sample_from_probs(combined, s->temperature, &next);
-        if (len < 8192) stream[len++] = next;
-        if (ngid < 4096) gids[ngid++] = next;
-
-        if (!tok_ready()) out[written++] = (unsigned char)next;
+        loops += (float)s.loops;
+        if (task_check(p, s.ans)) ok++;
+        else if (fails) ring_push(fails, p);
     }
-    if (tok_ready() && ngid > 0)
-        written += tok_decode(gids, ngid, out + written,
-                              outcap > written ? outcap - written : 0);
-    if (written < outcap) out[written] = '\0';
-    else if (outcap > 0) out[outcap - 1] = '\0';
+    if (avg_loops) *avg_loops = loops / (float)n;
+    return (float)ok / (float)n;
 }
 
-int sess_save(const Session *s, const char *core_path, const char *mem_path) {
-    if (model_save(&s->core->m, core_path) != 0) return -1;
-    if (nmem_save(s->mem, mem_path) != 0) return -1;
-    return 0;
+static int star_frontier(Model *M, KV *kv, int task, int level) {
+    int kept = 0;
+    for (int i = 0; i < STAR_N; i++) {
+        char p[PCAP], a[64];
+        task_gen(task, level, p, PCAP);
+        for (int attempt = 0; attempt < 2; attempt++) {
+            infer_answer(M, kv, p, M->c.loops, 0.8f, a, sizeof(a), NULL);
+            if (task_check(p, a)) { ring_push(&g_self, p); kept++; break; }
+        }
+    }
+    return kept;
 }
 
-int sess_load(Session *s, const char *core_path, const char *mem_path) {
-    if (model_load(&s->core->m, core_path) != 0) return -1;
-    NeuralMem *nm = nmem_load(mem_path);
-    if (!nm) return -1;
-    nmem_free(s->mem);
-    s->mem = nm;
-    return 0;
+static void curriculum_step(Model *M, KV *kv) {
+    int *L = levels(M);
+    printf("  curriculum:");
+    for (int t = 0; t < T_COUNT; t++) {
+        float acc = eval_level(M, kv, t, L[t], EVAL_N, 0, 1, &g_hard, NULL);
+        int star = 0;
+        if (L[t] < TASKS[t].train_max) star = star_frontier(M, kv, t, L[t] + 1);
+        printf(" %s@%d=%.0f%%", TASKS[t].name, L[t], acc * 100);
+        if (star) printf("(+%d)", star);
+        if (acc >= MASTERY && L[t] < TASKS[t].train_max) L[t]++;
+    }
+    printf("  hard=%d self=%d\n", g_hard.n, g_self.n);
+}
+
+void train_run(Model *M, const TrainOpts *o) {
+    Work *w = work_new(M, o->B, o->T);
+    KV *kv = kv_new(M);
+    if (!w) { fprintf(stderr, "error: T > seq\n"); return; }
+    levels(M);
+    double t0 = omp_get_wtime(), lsum = 0;
+    int lcnt = 0;
+    long long tokens = 0;
+    for (int s = 1; s <= o->steps; s++) {
+        for (int b = 0; b < o->B; b++)
+            fill_row(M, o, w->tok + (size_t)b * o->T, w->tgt + (size_t)b * o->T);
+        /* random depth: the shared blocks must work at any loop count */
+        int loops = M->c.loops;
+        if (loops > 1 && rng_uniform() < 0.3f) loops = 1 + rng_int(M->c.loops);
+        model_zero_grad(M);
+        float loss = model_forward(M, w, loops);
+        model_backward(M, w);
+        model_clip(M, 1.0f);
+        float warm = fminf(1.0f, (float)s / 200.0f);
+        float cosf_ = 0.1f + 0.45f * (1.0f + cosf(3.14159265f * (float)s / (float)o->steps));
+        model_adamw(M, o->lr * warm * cosf_, o->wd);
+        lsum += loss; lcnt++;
+        tokens += w->N;
+        if (s % o->log_every == 0) {
+            double dt = omp_get_wtime() - t0;
+            printf("step %5d loss %.4f  %.0f tok/s  %.0fs\n", s, lsum / lcnt,
+                   (double)tokens / dt, dt);
+            lsum = 0; lcnt = 0;
+            fflush(stdout);
+        }
+        if (s % o->eval_every == 0 || s == o->steps) {
+            curriculum_step(M, kv);
+            if (o->ckpt) model_save(M, o->ckpt);
+            fflush(stdout);
+        }
+    }
+    kv_free(kv);
+    work_free(w);
+}
+
+float eval_report(Model *M, int n, int votes, int extra) {
+    KV *kv = kv_new(M);
+    double tot = 0;
+    int cells = 0;
+    printf("%-6s", "task");
+    for (int l = 1; l <= 10; l++) printf("  L%-4d", l);
+    printf("   (* = beyond training ceiling)\n");
+    for (int t = 0; t < T_COUNT; t++) {
+        printf("%-6s", TASKS[t].name);
+        int maxl = TASKS[t].train_max + extra;
+        if (maxl > 10) maxl = 10;
+        for (int l = 1; l <= maxl; l++) {
+            float acc = eval_level(M, kv, t, l, n, 1, votes, NULL, NULL);
+            printf("  %3.0f%%%c", acc * 100, l > TASKS[t].train_max ? '*' : ' ');
+            if (l <= TASKS[t].train_max) { tot += acc; cells++; }
+        }
+        printf("\n");
+        fflush(stdout);
+    }
+    kv_free(kv);
+    float mean = cells ? (float)(tot / cells) : 0;
+    printf("mean accuracy within training ceiling: %.1f%%\n", mean * 100);
+    return mean;
 }

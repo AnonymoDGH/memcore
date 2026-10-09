@@ -1,9 +1,8 @@
 CC = gcc
-CFLAGS = -O2 -Wall -Wextra -std=c11 -Isrc
-LDFLAGS = -lm
+CFLAGS = -O3 -march=native -ffast-math -fopenmp -Wall -Wextra -std=c11 -Isrc
+LDFLAGS = -lm -fopenmp
 
-SRC = src/tensor.c src/tokenizer.c src/attention.c src/neural_mem.c \
-      src/replay.c src/train.c
+SRC = src/tensor.c src/model.c src/tasks.c src/memory.c src/infer.c src/train.c
 OBJ = $(SRC:.c=.o)
 
 all: memcore
@@ -11,17 +10,15 @@ all: memcore
 memcore: src/main.o $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-%.o: %.c
+%.o: %.c src/*.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-test: memcore_debug
-	./memcore_debug
-
-memcore_debug: src/main.o $(SRC) config/test.c
-	$(CC) -g -O0 -Wall -Wextra -std=c11 -Isrc -Iconfig \
-		-o $@ src/main.o $(filter-out src/main.o,$^) $(LDFLAGS)
+# gradient + kv-cache checks, built without fast-math
+test: tests/gradcheck.c src/model.c src/tensor.c
+	$(CC) -O1 -fopenmp -Wall -Wextra -std=c11 -Isrc -o gradcheck $^ -lm
+	./gradcheck
 
 clean:
-	rm -f *.o src/*.o memcore memcore_debug
+	rm -f src/*.o memcore gradcheck
 
 .PHONY: all test clean
