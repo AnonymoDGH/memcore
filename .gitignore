@@ -27,3 +27,6 @@ gradcheck
 *.mc
 *.mc.tmp
 *.knn
+__pycache__/
+*.pyc
+*.pt
